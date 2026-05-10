@@ -1,0 +1,59 @@
+agent:
+  name: viral-meme-agent
+  max_candidates_per_run: 5   # Max tweets envoyés par run
+  min_virality_score: 5       # Score minimum (1-10) pour envoyer
+
+scrapers:
+  nitter:
+    enabled: true
+    instances:
+      - https://nitter.poast.org
+      - https://nitter.privacydev.net
+      - https://nitter.1d4.us
+    regions:
+      - query: "meme OR viral OR funny"
+        label: Global
+      - query: "meme funny viral USA"
+        label: USA
+      - query: "Africa meme viral funny"
+        label: Africa
+      - query: "China viral trending meme"
+        label: Asia
+    max_posts: 10
+
+  reddit:
+    enabled: true
+    subreddits:
+      - r/memes
+      - r/dankmemes
+      - r/funny
+      - r/me_irl
+      - r/worldnews
+      - r/interestingasfuck
+    max_posts: 10
+    min_score: 1000
+
+media:
+  download_dir: /tmp/viral_media
+  max_size_mb: 50
+  allowed_types:
+    - image/jpeg
+    - image/png
+    - image/gif
+    - video/mp4
+
+tweet_generator:
+  language: english
+  max_length: 280
+  hashtags_count: 3
+  style: "engaging, witty, viral, relatable"
+
+notifier:
+  telegram:
+    enabled: true   # Mettre false pour désactiver
+  discord:
+    enabled: true   # Mettre false pour désactiver
+
+gemini:
+  model: gemini-1.5-flash
+  temperature: 0.85

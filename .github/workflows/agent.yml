@@ -1,0 +1,69 @@
+name: viral-meme-agent
+
+on:
+  schedule:
+    # ┌─ min  ┌─ hour  ┌─ day  ┌─ month  ┌─ weekday
+    # Runs every 6 hours — change "*/6" to any interval you want
+    # Examples:
+    #   Every 3h  →  0 */3 * * *
+    #   Every 12h →  0 */12 * * *
+    #   Once/day at 9 AM UTC →  0 9 * * *
+    - cron: '0 */6 * * *'
+
+  # Manual trigger from GitHub Actions UI
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Reason for manual run'
+        required: false
+        default: 'Manual trigger'
+
+jobs:
+  run-agent:
+    name: Scrape → Analyze → Notify
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      # ── 1. Checkout ──────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Python ────────────────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # ── 3. Cache pip dependencies ────────────────────────────────────────────
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      # ── 4. Install dependencies ───────────────────────────────────────────────
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # ── 5. Run pipeline ──────────────────────────────────────────────────────
+      - name: Run viral-meme-agent
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          cd src && python pipeline.py
+
+      # ── 6. Upload media artifacts (optional — for review) ────────────────────
+      - name: Upload media artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: viral-media-${{ github.run_id }}
+          path: /tmp/viral_media/
+          retention-days: 3   # Auto-deleted after 3 days
+          if-no-files-found: ignore
