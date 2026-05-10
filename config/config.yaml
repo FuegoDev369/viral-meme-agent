@@ -1,24 +1,27 @@
 agent:
   name: viral-meme-agent
-  max_candidates_per_run: 5   # Max tweets envoyés par run
-  min_virality_score: 5       # Score minimum Gemini (1-10) pour envoyer
+  max_candidates_per_run: 5
+  min_virality_score: 5
 
 scrapers:
-  # ── Désactivés (instances mortes / compte requis) ──────────────────────────
+  # ── Désactivés ─────────────────────────────────────────────────────────────
   nitter:
-    enabled: false
+    enabled: false      # instances mortes
 
   reddit:
-    enabled: false
+    enabled: false      # requiert un compte
 
-  # ── Actifs (zéro compte requis) ────────────────────────────────────────────
   ninegag:
-    enabled: true
-    max_posts: 20             # Posts à récupérer depuis le RSS
+    enabled: false      # RSS supprimé (404)
 
   memedroid:
+    enabled: false      # API morte (404)
+
+  # ── Actif ──────────────────────────────────────────────────────────────────
+  memeapi:
     enabled: true
-    max_posts: 15             # Posts à récupérer
+    count_per_subreddit: 5    # Posts demandés par subreddit
+    min_upvotes: 500          # Upvotes minimum pour considérer un post
 
 media:
   download_dir: /tmp/viral_media
@@ -38,9 +41,9 @@ tweet_generator:
 
 notifier:
   telegram:
-    enabled: true   # false pour désactiver
+    enabled: true
   discord:
-    enabled: false   # false pour désactiver
+    enabled: false    # Mettre true + ajouter DISCORD_WEBHOOK_URL si besoin
 
 gemini:
   model: gemini-2.0-flash
