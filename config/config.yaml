@@ -52,7 +52,7 @@ notifier:
   telegram:
     enabled: true   # Mettre false pour désactiver
   discord:
-    enabled: true   # Mettre false pour désactiver
+    enabled: false   # Mettre false pour désactiver
 
 gemini:
   model: gemini-1.5-flash
