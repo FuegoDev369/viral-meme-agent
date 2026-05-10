@@ -1,37 +1,24 @@
 agent:
   name: viral-meme-agent
   max_candidates_per_run: 5   # Max tweets envoyés par run
-  min_virality_score: 5       # Score minimum (1-10) pour envoyer
+  min_virality_score: 5       # Score minimum Gemini (1-10) pour envoyer
 
 scrapers:
+  # ── Désactivés (instances mortes / compte requis) ──────────────────────────
   nitter:
-    enabled: true
-    instances:
-      - https://nitter.poast.org
-      - https://nitter.privacydev.net
-      - https://nitter.1d4.us
-    regions:
-      - query: "meme OR viral OR funny"
-        label: Global
-      - query: "meme funny viral USA"
-        label: USA
-      - query: "Africa meme viral funny"
-        label: Africa
-      - query: "China viral trending meme"
-        label: Asia
-    max_posts: 10
+    enabled: false
 
   reddit:
+    enabled: false
+
+  # ── Actifs (zéro compte requis) ────────────────────────────────────────────
+  ninegag:
     enabled: true
-    subreddits:
-      - r/memes
-      - r/dankmemes
-      - r/funny
-      - r/me_irl
-      - r/worldnews
-      - r/interestingasfuck
-    max_posts: 10
-    min_score: 1000
+    max_posts: 20             # Posts à récupérer depuis le RSS
+
+  memedroid:
+    enabled: true
+    max_posts: 15             # Posts à récupérer
 
 media:
   download_dir: /tmp/viral_media
@@ -40,6 +27,7 @@ media:
     - image/jpeg
     - image/png
     - image/gif
+    - image/webp
     - video/mp4
 
 tweet_generator:
@@ -50,10 +38,10 @@ tweet_generator:
 
 notifier:
   telegram:
-    enabled: true   # Mettre false pour désactiver
+    enabled: true   # false pour désactiver
   discord:
-    enabled: false   # Mettre false pour désactiver
+    enabled: false   # false pour désactiver
 
 gemini:
-  model: gemini-1.5-flash
+  model: gemini-2.0-flash
   temperature: 0.85

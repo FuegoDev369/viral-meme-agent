@@ -1,4 +1,4 @@
-import google.generativeai as genai
+from google import genai
 import PIL.Image
 import logging
 import os
@@ -8,12 +8,11 @@ logger = logging.getLogger(__name__)
 
 class VisionAnalyzer:
     def __init__(self, config):
-        genai.configure(api_key=os.environ['GEMINI_API_KEY'])
-        self.model = genai.GenerativeModel(config['gemini']['model'])
+        self.client = genai.Client(api_key=os.environ['GEMINI_API_KEY'])
+        self.model = config['gemini']['model']
 
     def analyze(self, media_path, post_context=''):
         try:
-            # Only images supported by Gemini Vision (not mp4)
             if media_path.lower().endswith('.mp4'):
                 return self._analyze_text_only(post_context)
 
@@ -32,7 +31,10 @@ VIRALITY_REASON: [1-2 sentences on why this would go viral]
 REGION_RELEVANCE: [which regions/cultures would best relate: Global / USA / Africa / Asia / Europe]
 TREND_CATEGORY: [one of: meme / reaction / wholesome / politics / sports / entertainment / news / lifestyle]
 """
-            response = self.model.generate_content([prompt, img])
+            response = self.client.models.generate_content(
+                model=self.model,
+                contents=[prompt, img],
+            )
             return self._parse(response.text)
 
         except PIL.UnidentifiedImageError:
@@ -43,7 +45,6 @@ TREND_CATEGORY: [one of: meme / reaction / wholesome / politics / sports / enter
             return None
 
     def _analyze_text_only(self, context):
-        """Fallback for video content — analyze from title/text alone."""
         if not context:
             return None
         try:
@@ -60,7 +61,10 @@ VIRALITY_REASON: [Why this would go viral]
 REGION_RELEVANCE: [Global / USA / Africa / Asia / Europe]
 TREND_CATEGORY: [meme / reaction / wholesome / politics / sports / entertainment / news / lifestyle]
 """
-            response = self.model.generate_content(prompt)
+            response = self.client.models.generate_content(
+                model=self.model,
+                contents=prompt,
+            )
             result = self._parse(response.text)
             if result:
                 result['IS_VIDEO'] = True
@@ -75,11 +79,9 @@ TREND_CATEGORY: [meme / reaction / wholesome / politics / sports / entertainment
             if ':' in line:
                 key, _, value = line.partition(':')
                 result[key.strip()] = value.strip()
-
         try:
             raw = result.get('VIRALITY_SCORE', '0')
             result['VIRALITY_SCORE'] = int(''.join(filter(str.isdigit, raw.split('/')[0])) or '0')
         except Exception:
             result['VIRALITY_SCORE'] = 0
-
         return result if result else None

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-viral-meme-agent — Main Pipeline
-Scrapes viral content → analyzes with Gemini Vision → generates tweets → notifies via Telegram/Discord
+viral-meme-agent v3 — Main Pipeline
+Sources: 9gag RSS + Memedroid (zéro auth)
+→ Gemini Vision → Tweet Generator → Telegram/Discord
 """
 
 import sys
@@ -9,21 +10,18 @@ import os
 import yaml
 import json
 import logging
+import hashlib
 from pathlib import Path
 from datetime import datetime
 
-# Allow imports from src/
 sys.path.insert(0, os.path.dirname(__file__))
 
-from scrapers.nitter import NitterScraper
-from scrapers.reddit import RedditScraper
 from media.downloader import MediaDownloader
 from analyzer.vision import VisionAnalyzer
 from generator.tweet_gen import TweetGenerator
 from notifier.telegram_bot import TelegramNotifier
 from notifier.discord_notif import DiscordNotifier
 
-# ── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s  [%(levelname)s]  %(name)s — %(message)s',
@@ -31,14 +29,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger('pipeline')
 
-# ── Paths ─────────────────────────────────────────────────────────────────────
-BASE_DIR = Path(__file__).parent.parent  # project root
+BASE_DIR   = Path(__file__).parent.parent
 CONFIG_PATH = BASE_DIR / 'config' / 'config.yaml'
-STATE_PATH = BASE_DIR / 'state' / 'seen.json'
-STATE_MAX = 1000  # Max IDs to remember (rolling window)
+STATE_PATH  = BASE_DIR / 'state' / 'seen.json'
+STATE_MAX   = 1000
 
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def load_config():
     with open(CONFIG_PATH, 'r') as f:
@@ -54,62 +49,71 @@ def load_seen():
 
 def save_seen(seen: set):
     STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    # Keep only the last STATE_MAX entries to avoid bloat
-    trimmed = list(seen)[-STATE_MAX:]
     with open(STATE_PATH, 'w') as f:
-        json.dump(trimmed, f, indent=2)
+        json.dump(list(seen)[-STATE_MAX:], f, indent=2)
 
 
 def post_id(post: dict) -> str:
-    """Stable unique ID for a post based on its media URLs."""
-    key = '|'.join(post.get('media_urls', [])) + post.get('text', '')[:80]
-    import hashlib
+    key = '|'.join(post.get('media_urls', [])) + post.get('title', '')[:80]
     return hashlib.sha1(key.encode()).hexdigest()[:16]
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
-
 def run():
     logger.info("=" * 60)
-    logger.info("  🚀  viral-meme-agent starting")
+    logger.info("  🚀  viral-meme-agent v3 starting")
     logger.info(f"  ⏰  {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
     logger.info("=" * 60)
 
-    config = load_config()
-    seen = load_seen()
+    config   = load_config()
+    seen     = load_seen()
+    scrapers_cfg = config['scrapers']
 
-    min_score = config['agent']['min_virality_score']
+    min_score     = config['agent']['min_virality_score']
     max_candidates = config['agent']['max_candidates_per_run']
 
-    # ── Init modules ──────────────────────────────────────────────────────────
     downloader = MediaDownloader(config)
-    vision = VisionAnalyzer(config)
-    generator = TweetGenerator(config)
-    telegram = TelegramNotifier(config)
-    discord = DiscordNotifier(config)
+    vision     = VisionAnalyzer(config)
+    generator  = TweetGenerator(config)
+    telegram   = TelegramNotifier(config)
+    discord    = DiscordNotifier(config)
 
     # ── Scraping ──────────────────────────────────────────────────────────────
     all_posts = []
 
-    if config['scrapers']['nitter']['enabled']:
-        nitter = NitterScraper(config)
-        posts = nitter.scrape()
+    if scrapers_cfg.get('ninegag', {}).get('enabled', False):
+        from scrapers.ninegag import NineGagScraper
+        posts = NineGagScraper(config).scrape()
         all_posts.extend(posts)
 
-    if config['scrapers']['reddit']['enabled']:
-        reddit = RedditScraper(config)
-        posts = reddit.scrape()
+    if scrapers_cfg.get('memedroid', {}).get('enabled', False):
+        from scrapers.memedroid import MemedroidScraper
+        posts = MemedroidScraper(config).scrape()
         all_posts.extend(posts)
 
-    # Sort all by score descending
+    if scrapers_cfg.get('reddit', {}).get('enabled', False):
+        from scrapers.reddit import RedditScraper
+        posts = RedditScraper(config).scrape()
+        all_posts.extend(posts)
+
+    if scrapers_cfg.get('nitter', {}).get('enabled', False):
+        from scrapers.nitter import NitterScraper
+        posts = NitterScraper(config).scrape()
+        all_posts.extend(posts)
+
     all_posts.sort(key=lambda x: x.get('score', 0), reverse=True)
     logger.info(f"📦  Total posts scraped: {len(all_posts)}")
 
+    if not all_posts:
+        logger.warning("No posts collected — all scrapers returned empty. Check network or source availability.")
+        telegram.send_summary(0, 0)
+        discord.send_summary(0, 0)
+        return
+
     # ── Processing ────────────────────────────────────────────────────────────
-    sent = 0
-    skipped_seen = 0
-    skipped_media = 0
-    skipped_score = 0
+    sent           = 0
+    skipped_seen   = 0
+    skipped_media  = 0
+    skipped_score  = 0
 
     for post in all_posts:
         if sent >= max_candidates:
@@ -117,21 +121,17 @@ def run():
             break
 
         pid = post_id(post)
-
-        # Dedup check
         if pid in seen:
             skipped_seen += 1
             continue
 
-        # Download media
         media_path = downloader.download_best(post.get('media_urls', []))
         if not media_path:
             skipped_media += 1
-            seen.add(pid)  # Mark so we don't retry a broken post
+            seen.add(pid)
             continue
 
-        # Vision analysis
-        context = post.get('title', '') or post.get('text', '')
+        context  = post.get('title', '') or post.get('text', '')
         analysis = vision.analyze(media_path, context)
         if not analysis:
             logger.warning("Vision analysis returned None, skipping")
@@ -140,7 +140,7 @@ def run():
         virality = analysis.get('VIRALITY_SCORE', 0)
         logger.info(
             f"Score {virality}/10  [{post.get('region', '?')}]  "
-            f"source={post.get('source')}  cat={analysis.get('TREND_CATEGORY', '?')}"
+            f"src={post.get('source')}  cat={analysis.get('TREND_CATEGORY', '?')}"
         )
 
         if virality < min_score:
@@ -148,21 +148,13 @@ def run():
             seen.add(pid)
             continue
 
-        # Tweet generation
         tweet = generator.generate(analysis, context, post.get('region', 'Global'))
         if not tweet or not tweet.get('full_tweet'):
             logger.warning("Tweet generation failed, skipping")
             continue
 
-        # Build payload
-        source_label = post.get('source', '?')
-        if post.get('subreddit'):
-            source_label += f" / {post['subreddit']}"
-        elif post.get('region'):
-            source_label += f" / {post['region']}"
-
         payload = {
-            'source': source_label,
+            'source': post.get('source', '?'),
             'region': post.get('region', 'Global'),
             'analysis': analysis,
             'tweet': tweet,
@@ -170,7 +162,6 @@ def run():
             'scraped_at': post.get('scraped_at'),
         }
 
-        # ── Notify ────────────────────────────────────────────────────────────
         telegram.send_candidate(payload)
         discord.send_candidate(payload)
 

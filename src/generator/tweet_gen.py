@@ -1,4 +1,5 @@
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 import logging
 import os
 
@@ -7,14 +8,10 @@ logger = logging.getLogger(__name__)
 
 class TweetGenerator:
     def __init__(self, config):
-        genai.configure(api_key=os.environ['GEMINI_API_KEY'])
+        self.client = genai.Client(api_key=os.environ['GEMINI_API_KEY'])
         cfg = config['gemini']
-        self.model = genai.GenerativeModel(
-            cfg['model'],
-            generation_config=genai.types.GenerationConfig(
-                temperature=cfg['temperature'],
-            )
-        )
+        self.model = cfg['model']
+        self.temperature = cfg['temperature']
         tw = config['tweet_generator']
         self.max_length = tw['max_length']
         self.hashtags_count = tw['hashtags_count']
@@ -40,14 +37,18 @@ RULES:
 - Start with a powerful hook: a question, bold claim, or relatable statement
 - Max 2 emojis — make it feel human, not AI
 - Do NOT use quotation marks around the tweet
-- Do NOT reference Reddit or Nitter as the source
+- Do NOT reference Reddit or any scraping source
 
 Respond with ONLY these two lines, nothing else:
 
 TWEET: [your tweet text without hashtags]
-HASHTAGS: [#{'{'}tag1{'}'} #{'{'}tag2{'}'} #{'{'}tag3{'}'}]
+HASHTAGS: [#tag1 #tag2 #tag3]
 """
-            response = self.model.generate_content(prompt)
+            response = self.client.models.generate_content(
+                model=self.model,
+                contents=prompt,
+                config=types.GenerateContentConfig(temperature=self.temperature),
+            )
             return self._parse(response.text)
 
         except Exception as e:
@@ -56,7 +57,6 @@ HASHTAGS: [#{'{'}tag1{'}'} #{'{'}tag2{'}'} #{'{'}tag3{'}'}]
 
     def _parse(self, text):
         result = {'tweet_body': '', 'hashtags': '', 'full_tweet': ''}
-
         for line in text.strip().split('\n'):
             if line.upper().startswith('TWEET:'):
                 result['tweet_body'] = line.split(':', 1)[1].strip()
@@ -64,8 +64,6 @@ HASHTAGS: [#{'{'}tag1{'}'} #{'{'}tag2{'}'} #{'{'}tag3{'}'}]
                 result['hashtags'] = line.split(':', 1)[1].strip()
 
         combined = f"{result['tweet_body']} {result['hashtags']}".strip()
-
-        # Truncate if needed (safety net)
         if len(combined) > 280:
             max_body = 280 - len(result['hashtags']) - 1
             result['tweet_body'] = result['tweet_body'][:max_body].rsplit(' ', 1)[0] + '…'
