@@ -5,31 +5,46 @@ Fallback : Mistral Small
 """
 from google import genai
 from google.genai import types
-from mistralai import Mistral
 import logging
 import os
 import time
+
+try:
+    from mistralai import Mistral
+    MISTRAL_AVAILABLE = True
+except ImportError:
+    Mistral = None
+    MISTRAL_AVAILABLE = False
 
 from analyzer.vision import QuotaExhaustedError
 
 logger = logging.getLogger(__name__)
 
-MAX_RETRIES  = 3
-RETRY_DELAY  = 25
+MAX_RETRIES = 3
+RETRY_DELAY = 25
 
 
 class TweetGenerator:
     def __init__(self, config):
-        # ── Gemini ────────────────────────────────────────────────────────────
+        # ── Gemini (primary) ──────────────────────────────────────────────────
         self.gemini      = genai.Client(api_key=os.environ['GEMINI_API_KEY'])
         cfg              = config['gemini']
         self.g_model     = cfg['model']
         self.temperature = cfg['temperature']
 
         # ── Mistral (fallback) ────────────────────────────────────────────────
-        mistral_key   = os.environ.get('MISTRAL_API_KEY', '')
-        self.mistral  = Mistral(api_key=mistral_key) if mistral_key else None
-        self.m_model  = config['mistral']['text_model']
+        self.mistral = None
+        self.m_model = config.get('mistral', {}).get('text_model', 'mistral-small-latest')
+
+        if MISTRAL_AVAILABLE:
+            mistral_key = os.environ.get('MISTRAL_API_KEY', '')
+            if mistral_key:
+                self.mistral = Mistral(api_key=mistral_key)
+                logger.info("[TweetGen] Mistral fallback activé ✅")
+            else:
+                logger.warning("[TweetGen] MISTRAL_API_KEY absent — fallback désactivé")
+        else:
+            logger.warning("[TweetGen] Package mistralai non disponible — fallback désactivé")
 
         tw = config['tweet_generator']
         self.max_length     = tw['max_length']
@@ -62,7 +77,7 @@ TWEET: [tweet text without hashtags]
 HASHTAGS: [#tag1 #tag2 #tag3]
 """
 
-    # ── Gemini call ───────────────────────────────────────────────────────────
+    # ── Gemini ────────────────────────────────────────────────────────────────
 
     def _gemini_call(self, prompt):
         for attempt in range(1, MAX_RETRIES + 1):
@@ -85,7 +100,7 @@ HASHTAGS: [#tag1 #tag2 #tag3]
                     logger.error(f"[TweetGen/Gemini] Erreur: {e}")
                     return None
 
-    # ── Mistral call ──────────────────────────────────────────────────────────
+    # ── Mistral ───────────────────────────────────────────────────────────────
 
     def _mistral_call(self, prompt):
         if not self.mistral:
@@ -113,7 +128,7 @@ HASHTAGS: [#tag1 #tag2 #tag3]
                 logger.info("[TweetGen] ✅ Gemini OK")
                 return self._parse(text)
         except QuotaExhaustedError:
-            pass  # → fallback Mistral
+            pass
 
         # 2 — Mistral fallback
         text = self._mistral_call(prompt)
@@ -122,8 +137,8 @@ HASHTAGS: [#tag1 #tag2 #tag3]
             return self._parse(text)
 
         # 3 — Les deux ont échoué
-        logger.error("[TweetGen] ❌ Gemini ET Mistral ont échoué")
-        raise QuotaExhaustedError("Gemini + Mistral : quotas épuisés ou indisponibles.")
+        logger.error("[TweetGen] ❌ Tous les providers ont échoué")
+        raise QuotaExhaustedError("Gemini + Mistral : indisponibles.")
 
     def _parse(self, text):
         result = {'tweet_body': '', 'hashtags': '', 'full_tweet': ''}

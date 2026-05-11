@@ -4,17 +4,23 @@ Primary  : Google Gemini 2.0 Flash Lite
 Fallback : Mistral Small (multimodal)
 """
 from google import genai
-from mistralai import Mistral
 import PIL.Image
 import base64
 import logging
 import os
 import time
 
+try:
+    from mistralai import Mistral
+    MISTRAL_AVAILABLE = True
+except ImportError:
+    Mistral = None
+    MISTRAL_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
-MAX_RETRIES  = 3
-RETRY_DELAY  = 25  # secondes entre chaque retry 429
+MAX_RETRIES = 3
+RETRY_DELAY = 25
 
 EXT_TO_MIME = {
     '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
@@ -52,25 +58,33 @@ TREND_CATEGORY: [meme / reaction / wholesome / politics / sports / entertainment
 
 
 class QuotaExhaustedError(Exception):
-    """Levée quand les deux providers (Gemini + Mistral) sont épuisés."""
+    """Levée quand tous les providers disponibles sont épuisés."""
     pass
 
 
 class VisionAnalyzer:
     def __init__(self, config):
-        # ── Gemini ────────────────────────────────────────────────────────────
+        # ── Gemini (primary) ──────────────────────────────────────────────────
         self.gemini  = genai.Client(api_key=os.environ['GEMINI_API_KEY'])
         self.g_model = config['gemini']['model']
 
         # ── Mistral (fallback) ────────────────────────────────────────────────
-        mistral_key  = os.environ.get('MISTRAL_API_KEY', '')
-        self.mistral  = Mistral(api_key=mistral_key) if mistral_key else None
-        self.m_model  = config['mistral']['vision_model']
+        self.mistral = None
+        self.m_model = config.get('mistral', {}).get('vision_model', 'mistral-small-latest')
 
-    # ── Gemini call ───────────────────────────────────────────────────────────
+        if MISTRAL_AVAILABLE:
+            mistral_key = os.environ.get('MISTRAL_API_KEY', '')
+            if mistral_key:
+                self.mistral = Mistral(api_key=mistral_key)
+                logger.info("[Vision] Mistral fallback activé ✅")
+            else:
+                logger.warning("[Vision] MISTRAL_API_KEY absent — fallback désactivé")
+        else:
+            logger.warning("[Vision] Package mistralai non disponible — fallback désactivé")
+
+    # ── Gemini ────────────────────────────────────────────────────────────────
 
     def _gemini_call(self, contents):
-        """Retourne le texte ou lève QuotaExhaustedError si 429 persiste."""
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 r = self.gemini.models.generate_content(
@@ -88,10 +102,9 @@ class VisionAnalyzer:
                     logger.error(f"[Vision/Gemini] Erreur: {e}")
                     return None
 
-    # ── Mistral call ──────────────────────────────────────────────────────────
+    # ── Mistral ───────────────────────────────────────────────────────────────
 
     def _mistral_vision_call(self, image_path, prompt):
-        """Analyse d'image via Mistral Small (multimodal)."""
         if not self.mistral:
             return None
         try:
@@ -99,17 +112,13 @@ class VisionAnalyzer:
             mime = EXT_TO_MIME.get(ext, 'image/jpeg')
             with open(image_path, 'rb') as f:
                 b64 = base64.b64encode(f.read()).decode('utf-8')
-
             r = self.mistral.chat.complete(
                 model=self.m_model,
-                messages=[{
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url",
-                         "image_url": {"url": f"data:{mime};base64,{b64}"}}
-                    ]
-                }]
+                messages=[{"role": "user", "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url",
+                     "image_url": {"url": f"data:{mime};base64,{b64}"}}
+                ]}]
             )
             return r.choices[0].message.content
         except Exception as e:
@@ -117,7 +126,6 @@ class VisionAnalyzer:
             return None
 
     def _mistral_text_call(self, prompt):
-        """Analyse texte seul via Mistral (pour les vidéos)."""
         if not self.mistral:
             return None
         try:
@@ -140,7 +148,7 @@ class VisionAnalyzer:
             img    = PIL.Image.open(media_path)
             prompt = PROMPT_TEMPLATE.format(context=post_context[:300] or 'N/A')
         except PIL.UnidentifiedImageError:
-            logger.warning(f"Impossible d'ouvrir l'image: {media_path}")
+            logger.warning(f"Impossible d'ouvrir: {media_path}")
             return None
 
         # 1 — Gemini
@@ -150,7 +158,7 @@ class VisionAnalyzer:
                 logger.info("[Vision] ✅ Gemini OK")
                 return self._parse(text)
         except QuotaExhaustedError:
-            pass  # → fallback Mistral
+            pass
 
         # 2 — Mistral fallback
         text = self._mistral_vision_call(media_path, prompt)
@@ -159,15 +167,14 @@ class VisionAnalyzer:
             return self._parse(text)
 
         # 3 — Les deux ont échoué
-        logger.error("[Vision] ❌ Gemini ET Mistral ont échoué")
-        raise QuotaExhaustedError("Gemini + Mistral : quotas épuisés ou indisponibles.")
+        logger.error("[Vision] ❌ Tous les providers ont échoué")
+        raise QuotaExhaustedError("Gemini + Mistral : indisponibles.")
 
     def _analyze_text_only(self, context):
         if not context:
             return None
         prompt = TEXT_PROMPT_TEMPLATE.format(context=context[:400])
 
-        # 1 — Gemini
         try:
             text = self._gemini_call(prompt)
             if text:
@@ -178,7 +185,6 @@ class VisionAnalyzer:
         except QuotaExhaustedError:
             pass
 
-        # 2 — Mistral fallback
         text = self._mistral_text_call(prompt)
         if text:
             result = self._parse(text)
@@ -186,7 +192,7 @@ class VisionAnalyzer:
                 result['IS_VIDEO'] = True
             return result
 
-        raise QuotaExhaustedError("Gemini + Mistral : quotas épuisés ou indisponibles.")
+        raise QuotaExhaustedError("Gemini + Mistral : indisponibles.")
 
     def _parse(self, text):
         result = {}
