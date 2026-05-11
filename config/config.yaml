@@ -46,5 +46,5 @@ notifier:
     enabled: false    # Mettre true + ajouter DISCORD_WEBHOOK_URL si besoin
 
 gemini:
-  model: gemini-2.0-flash
+  model: gemini-1.5-flash
   temperature: 0.85

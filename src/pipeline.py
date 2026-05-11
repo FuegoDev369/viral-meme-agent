@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-viral-meme-agent v4 — Main Pipeline
+viral-meme-agent v4.1 — Main Pipeline
 Source : meme-api.com (public, zéro auth)
-→ Gemini Vision → Tweet Generator → Telegram/Discord
+→ Gemini 1.5 Flash (avec rate limiting) → Tweet Generator → Telegram/Discord
 """
 
-import sys, os, yaml, json, logging, hashlib
+import sys, os, yaml, json, logging, hashlib, time
 from pathlib import Path
 from datetime import datetime
 
@@ -28,6 +28,11 @@ BASE_DIR    = Path(__file__).parent.parent
 CONFIG_PATH = BASE_DIR / 'config' / 'config.yaml'
 STATE_PATH  = BASE_DIR / 'state' / 'seen.json'
 STATE_MAX   = 1000
+
+# Délai entre chaque post traité (vision + tweet_gen = 2 appels Gemini)
+# Free tier: 15 req/min → 1 req toutes les 4s minimum
+# On prend 8s de marge pour être safe avec 2 appels par post
+GEMINI_INTER_POST_DELAY = 8  # secondes
 
 
 def load_config():
@@ -52,7 +57,7 @@ def post_id(post):
 
 def run():
     logger.info("=" * 60)
-    logger.info("  🚀  viral-meme-agent v4 starting")
+    logger.info("  🚀  viral-meme-agent v4.1 starting")
     logger.info(f"  ⏰  {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
     logger.info("=" * 60)
 
@@ -96,7 +101,7 @@ def run():
     logger.info(f"📦  Total posts scraped: {len(all_posts)}")
 
     if not all_posts:
-        logger.warning("⚠️  Aucun post collecté — vérifie les scrapers actifs.")
+        logger.warning("⚠️  Aucun post collecté.")
         telegram.send_summary(0, 0)
         discord.send_summary(0, 0)
         return
@@ -104,7 +109,7 @@ def run():
     # ── Processing ────────────────────────────────────────────────────────────
     sent, skipped_seen, skipped_media, skipped_score = 0, 0, 0, 0
 
-    for post in all_posts:
+    for i, post in enumerate(all_posts):
         if sent >= max_candidates:
             logger.info(f"Max candidats atteint ({max_candidates}), arrêt.")
             break
@@ -119,6 +124,11 @@ def run():
             skipped_media += 1
             seen.add(pid)
             continue
+
+        # Délai entre posts pour respecter le rate limit Gemini (free tier: 15 RPM)
+        if i > 0:
+            logger.info(f"⏳  Attente {GEMINI_INTER_POST_DELAY}s (rate limit Gemini)...")
+            time.sleep(GEMINI_INTER_POST_DELAY)
 
         context  = post.get('title', '') or post.get('text', '')
         analysis = vision.analyze(media_path, context)

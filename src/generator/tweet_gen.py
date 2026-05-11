@@ -2,8 +2,12 @@ from google import genai
 from google.genai import types
 import logging
 import os
+import time
 
 logger = logging.getLogger(__name__)
+
+MAX_RETRIES = 3
+RETRY_DELAY = 20  # secondes entre chaque retry sur 429
 
 
 class TweetGenerator:
@@ -16,6 +20,29 @@ class TweetGenerator:
         self.max_length = tw['max_length']
         self.hashtags_count = tw['hashtags_count']
         self.style = tw['style']
+
+    def _call_gemini(self, prompt):
+        """Appel Gemini avec retry automatique sur 429."""
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                response = self.client.models.generate_content(
+                    model=self.model,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(temperature=self.temperature),
+                )
+                return response.text
+            except Exception as e:
+                err = str(e)
+                if '429' in err or 'RESOURCE_EXHAUSTED' in err:
+                    if attempt < MAX_RETRIES:
+                        logger.warning(f"[TweetGen] 429 rate limit — retry {attempt}/{MAX_RETRIES} dans {RETRY_DELAY}s...")
+                        time.sleep(RETRY_DELAY)
+                    else:
+                        logger.error(f"[TweetGen] 429 persistant après {MAX_RETRIES} tentatives, skip.")
+                        return None
+                else:
+                    logger.error(f"[TweetGen] Erreur Gemini: {e}")
+                    return None
 
     def generate(self, analysis, original_text='', region='Global'):
         try:
@@ -44,15 +71,11 @@ Respond with ONLY these two lines, nothing else:
 TWEET: [your tweet text without hashtags]
 HASHTAGS: [#tag1 #tag2 #tag3]
 """
-            response = self.client.models.generate_content(
-                model=self.model,
-                contents=prompt,
-                config=types.GenerateContentConfig(temperature=self.temperature),
-            )
-            return self._parse(response.text)
+            text = self._call_gemini(prompt)
+            return self._parse(text) if text else None
 
         except Exception as e:
-            logger.error(f"Tweet generation failed: {e}")
+            logger.error(f"TweetGenerator.generate() failed: {e}")
             return None
 
     def _parse(self, text):
