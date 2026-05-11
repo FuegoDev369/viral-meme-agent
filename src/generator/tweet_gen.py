@@ -4,25 +4,26 @@ import logging
 import os
 import time
 
+from analyzer.vision import QuotaExhaustedError
+
 logger = logging.getLogger(__name__)
 
-MAX_RETRIES = 3
-RETRY_DELAY = 20  # secondes entre chaque retry sur 429
+MAX_RETRIES  = 3
+RETRY_DELAY  = 25
 
 
 class TweetGenerator:
     def __init__(self, config):
-        self.client = genai.Client(api_key=os.environ['GEMINI_API_KEY'])
-        cfg = config['gemini']
-        self.model = cfg['model']
+        self.client      = genai.Client(api_key=os.environ['GEMINI_API_KEY'])
+        cfg              = config['gemini']
+        self.model       = cfg['model']
         self.temperature = cfg['temperature']
-        tw = config['tweet_generator']
-        self.max_length = tw['max_length']
-        self.hashtags_count = tw['hashtags_count']
-        self.style = tw['style']
+        tw               = config['tweet_generator']
+        self.max_length      = tw['max_length']
+        self.hashtags_count  = tw['hashtags_count']
+        self.style           = tw['style']
 
     def _call_gemini(self, prompt):
-        """Appel Gemini avec retry automatique sur 429."""
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 response = self.client.models.generate_content(
@@ -35,18 +36,18 @@ class TweetGenerator:
                 err = str(e)
                 if '429' in err or 'RESOURCE_EXHAUSTED' in err:
                     if attempt < MAX_RETRIES:
-                        logger.warning(f"[TweetGen] 429 rate limit — retry {attempt}/{MAX_RETRIES} dans {RETRY_DELAY}s...")
+                        logger.warning(f"[TweetGen] 429 — retry {attempt}/{MAX_RETRIES} dans {RETRY_DELAY}s...")
                         time.sleep(RETRY_DELAY)
                     else:
-                        logger.error(f"[TweetGen] 429 persistant après {MAX_RETRIES} tentatives, skip.")
-                        return None
+                        raise QuotaExhaustedError(
+                            "Quota journalier Gemini épuisé. Réessaie demain après 8h UTC."
+                        )
                 else:
                     logger.error(f"[TweetGen] Erreur Gemini: {e}")
                     return None
 
     def generate(self, analysis, original_text='', region='Global'):
-        try:
-            prompt = f"""You are a viral Twitter/X growth expert. Your job is to craft tweets that maximize impressions and engagement.
+        prompt = f"""You are a viral Twitter/X growth expert. Craft a tweet that maximizes impressions and engagement.
 
 CONTENT ANALYSIS:
 - Description: {analysis.get('DESCRIPTION', '')}
@@ -58,25 +59,20 @@ CONTENT ANALYSIS:
 
 RULES:
 - Language: English ONLY
-- Max tweet length: {self.max_length} characters (tweet + hashtags combined)
+- Max length: {self.max_length} characters (tweet + hashtags combined)
 - Style: {self.style}
-- Must include exactly {self.hashtags_count} hashtags at the end
-- Start with a powerful hook: a question, bold claim, or relatable statement
-- Max 2 emojis — make it feel human, not AI
-- Do NOT use quotation marks around the tweet
+- Exactly {self.hashtags_count} hashtags at the end
+- Start with a strong hook (question, bold claim, or relatable opener)
+- Max 2 emojis — feel human, not AI
 - Do NOT reference Reddit or any scraping source
 
-Respond with ONLY these two lines, nothing else:
+Respond with ONLY these two lines:
 
-TWEET: [your tweet text without hashtags]
+TWEET: [tweet text without hashtags]
 HASHTAGS: [#tag1 #tag2 #tag3]
 """
-            text = self._call_gemini(prompt)
-            return self._parse(text) if text else None
-
-        except Exception as e:
-            logger.error(f"TweetGenerator.generate() failed: {e}")
-            return None
+        text = self._call_gemini(prompt)  # May raise QuotaExhaustedError
+        return self._parse(text) if text else None
 
     def _parse(self, text):
         result = {'tweet_body': '', 'hashtags': '', 'full_tweet': ''}
@@ -92,6 +88,6 @@ HASHTAGS: [#tag1 #tag2 #tag3]
             result['tweet_body'] = result['tweet_body'][:max_body].rsplit(' ', 1)[0] + '…'
             combined = f"{result['tweet_body']} {result['hashtags']}".strip()
 
-        result['full_tweet'] = combined
-        result['char_count'] = len(combined)
+        result['full_tweet']  = combined
+        result['char_count']  = len(combined)
         return result

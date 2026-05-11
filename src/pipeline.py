@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-viral-meme-agent v4.1 — Main Pipeline
+viral-meme-agent v4.3 — Main Pipeline
 Source : meme-api.com (public, zéro auth)
-→ Gemini 1.5 Flash (avec rate limiting) → Tweet Generator → Telegram/Discord
+→ Gemini Vision → Tweet Generator → Telegram/Discord
 """
 
 import sys, os, yaml, json, logging, hashlib, time
@@ -12,7 +12,7 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(__file__))
 
 from media.downloader import MediaDownloader
-from analyzer.vision import VisionAnalyzer
+from analyzer.vision import VisionAnalyzer, QuotaExhaustedError
 from generator.tweet_gen import TweetGenerator
 from notifier.telegram_bot import TelegramNotifier
 from notifier.discord_notif import DiscordNotifier
@@ -29,10 +29,10 @@ CONFIG_PATH = BASE_DIR / 'config' / 'config.yaml'
 STATE_PATH  = BASE_DIR / 'state' / 'seen.json'
 STATE_MAX   = 1000
 
-# Délai entre chaque post traité (vision + tweet_gen = 2 appels Gemini)
-# Free tier: 15 req/min → 1 req toutes les 4s minimum
-# On prend 8s de marge pour être safe avec 2 appels par post
-GEMINI_INTER_POST_DELAY = 8  # secondes
+# Délai entre 2 posts pour respecter le rate limit Gemini free tier
+# 2 appels par post (vision + tweet) → 1 appel toutes les ~4s min
+# On prend 6s de marge
+INTER_POST_DELAY = 6
 
 
 def load_config():
@@ -57,7 +57,7 @@ def post_id(post):
 
 def run():
     logger.info("=" * 60)
-    logger.info("  🚀  viral-meme-agent v4.1 starting")
+    logger.info("  🚀  viral-meme-agent v4.3 starting")
     logger.info(f"  ⏰  {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
     logger.info("=" * 60)
 
@@ -108,8 +108,9 @@ def run():
 
     # ── Processing ────────────────────────────────────────────────────────────
     sent, skipped_seen, skipped_media, skipped_score = 0, 0, 0, 0
+    gemini_calls = 0  # Compteur pour le sleep inter-post
 
-    for i, post in enumerate(all_posts):
+    for post in all_posts:
         if sent >= max_candidates:
             logger.info(f"Max candidats atteint ({max_candidates}), arrêt.")
             break
@@ -125,13 +126,33 @@ def run():
             seen.add(pid)
             continue
 
-        # Délai entre posts pour respecter le rate limit Gemini (free tier: 15 RPM)
-        if i > 0:
-            logger.info(f"⏳  Attente {GEMINI_INTER_POST_DELAY}s (rate limit Gemini)...")
-            time.sleep(GEMINI_INTER_POST_DELAY)
+        # Sleep uniquement avant un vrai appel Gemini (pas avant les skips)
+        if gemini_calls > 0:
+            logger.info(f"⏳  Pause {INTER_POST_DELAY}s (rate limit Gemini)...")
+            time.sleep(INTER_POST_DELAY)
 
-        context  = post.get('title', '') or post.get('text', '')
-        analysis = vision.analyze(media_path, context)
+        context = post.get('title', '') or post.get('text', '')
+
+        try:
+            analysis = vision.analyze(media_path, context)
+            gemini_calls += 1
+        except QuotaExhaustedError as e:
+            logger.error(f"🚫  {e}")
+            # Notifier l'utilisateur et stopper immédiatement
+            quota_msg = (
+                "🚫 *Quota Gemini épuisé*\n"
+                "Le quota journalier de ta clé API est atteint.\n"
+                f"📅 Reset automatique à *8h00 UTC* demain.\n"
+                f"📤 Candidats envoyés ce run : {sent}"
+            )
+            telegram._api('sendMessage', json={
+                'chat_id': os.environ.get('TELEGRAM_CHAT_ID', ''),
+                'text': quota_msg,
+                'parse_mode': 'Markdown'
+            })
+            save_seen(seen)
+            return
+
         if not analysis:
             logger.warning("Vision analysis None, skip")
             continue
@@ -147,7 +168,24 @@ def run():
             seen.add(pid)
             continue
 
-        tweet = generator.generate(analysis, context, post.get('region', 'Global'))
+        try:
+            tweet = generator.generate(analysis, context, post.get('region', 'Global'))
+            gemini_calls += 1
+        except QuotaExhaustedError as e:
+            logger.error(f"🚫  {e}")
+            quota_msg = (
+                "🚫 *Quota Gemini épuisé (tweet gen)*\n"
+                f"📅 Reset automatique à *8h00 UTC* demain.\n"
+                f"📤 Candidats envoyés ce run : {sent}"
+            )
+            telegram._api('sendMessage', json={
+                'chat_id': os.environ.get('TELEGRAM_CHAT_ID', ''),
+                'text': quota_msg,
+                'parse_mode': 'Markdown'
+            })
+            save_seen(seen)
+            return
+
         if not tweet or not tweet.get('full_tweet'):
             logger.warning("Tweet generation failed, skip")
             continue
@@ -170,10 +208,11 @@ def run():
     save_seen(seen)
     logger.info("=" * 60)
     logger.info(f"  ✅  Run complet")
-    logger.info(f"  📤  Envoyés      : {sent}")
-    logger.info(f"  🔁  Déjà vus     : {skipped_seen}")
-    logger.info(f"  📵  Pas de media : {skipped_media}")
-    logger.info(f"  📉  Score < {min_score}    : {skipped_score}")
+    logger.info(f"  📤  Envoyés        : {sent}")
+    logger.info(f"  🔁  Déjà vus       : {skipped_seen}")
+    logger.info(f"  📵  Pas de media   : {skipped_media}")
+    logger.info(f"  📉  Score < {min_score}      : {skipped_score}")
+    logger.info(f"  🤖  Appels Gemini  : {gemini_calls}")
     logger.info("=" * 60)
 
     telegram.send_summary(len(all_posts), sent)

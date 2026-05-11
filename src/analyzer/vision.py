@@ -6,17 +6,21 @@ import time
 
 logger = logging.getLogger(__name__)
 
-MAX_RETRIES = 3
-RETRY_DELAY = 20   # secondes entre chaque retry sur 429
+MAX_RETRIES  = 3
+RETRY_DELAY  = 25   # secondes entre chaque retry sur 429
+
+
+class QuotaExhaustedError(Exception):
+    """Levée quand le quota journalier Gemini est épuisé."""
+    pass
 
 
 class VisionAnalyzer:
     def __init__(self, config):
         self.client = genai.Client(api_key=os.environ['GEMINI_API_KEY'])
-        self.model = config['gemini']['model']
+        self.model  = config['gemini']['model']
 
     def _call_gemini(self, contents):
-        """Appel Gemini avec retry automatique sur 429."""
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 response = self.client.models.generate_content(
@@ -28,11 +32,13 @@ class VisionAnalyzer:
                 err = str(e)
                 if '429' in err or 'RESOURCE_EXHAUSTED' in err:
                     if attempt < MAX_RETRIES:
-                        logger.warning(f"[Vision] 429 rate limit — retry {attempt}/{MAX_RETRIES} dans {RETRY_DELAY}s...")
+                        logger.warning(f"[Vision] 429 — retry {attempt}/{MAX_RETRIES} dans {RETRY_DELAY}s...")
                         time.sleep(RETRY_DELAY)
                     else:
-                        logger.error(f"[Vision] 429 persistant après {MAX_RETRIES} tentatives, skip.")
-                        return None
+                        # Quota épuisé après tous les retries → stop total
+                        raise QuotaExhaustedError(
+                            "Quota journalier Gemini épuisé. Réessaie demain après 8h UTC."
+                        )
                 else:
                     logger.error(f"[Vision] Erreur Gemini: {e}")
                     return None
@@ -43,7 +49,6 @@ class VisionAnalyzer:
                 return self._analyze_text_only(post_context)
 
             img = PIL.Image.open(media_path)
-
             prompt = f"""You are an expert in viral internet content. Analyze this image/meme carefully.
 
 Context from scraper: "{post_context[:300] if post_context else 'N/A'}"
@@ -60,6 +65,8 @@ TREND_CATEGORY: [one of: meme / reaction / wholesome / politics / sports / enter
             text = self._call_gemini([prompt, img])
             return self._parse(text) if text else None
 
+        except QuotaExhaustedError:
+            raise   # Re-propager pour que pipeline.py stoppe
         except PIL.UnidentifiedImageError:
             logger.warning(f"Cannot open image: {media_path}")
             return None
@@ -70,7 +77,7 @@ TREND_CATEGORY: [one of: meme / reaction / wholesome / politics / sports / enter
     def _analyze_text_only(self, context):
         if not context:
             return None
-        prompt = f"""You are an expert in viral internet content. Based only on this text description of a video:
+        prompt = f"""You are an expert in viral internet content. Based only on this text description:
 
 "{context[:400]}"
 
