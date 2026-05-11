@@ -4,24 +4,18 @@ agent:
   min_virality_score: 5
 
 scrapers:
-  # ── Désactivés ─────────────────────────────────────────────────────────────
   nitter:
-    enabled: false      # instances mortes
-
+    enabled: false
   reddit:
-    enabled: false      # requiert un compte
-
+    enabled: false
   ninegag:
-    enabled: false      # RSS supprimé (404)
-
+    enabled: false
   memedroid:
-    enabled: false      # API morte (404)
-
-  # ── Actif ──────────────────────────────────────────────────────────────────
+    enabled: false
   memeapi:
     enabled: true
-    count_per_subreddit: 5    # Posts demandés par subreddit
-    min_upvotes: 500          # Upvotes minimum pour considérer un post
+    count_per_subreddit: 5
+    min_upvotes: 500
 
 media:
   download_dir: /tmp/viral_media
@@ -43,8 +37,13 @@ notifier:
   telegram:
     enabled: true
   discord:
-    enabled: false    # Mettre true + ajouter DISCORD_WEBHOOK_URL si besoin
+    enabled: false
 
+# ── LLM Providers ─────────────────────────────────────────────────────────────
 gemini:
-  model: gemini-2.0-flash-lite
+  model: gemini-2.0-flash-lite   # Primary
   temperature: 0.85
+
+mistral:
+  vision_model: mistral-small-latest  # Fallback vision (multimodal)
+  text_model: mistral-small-latest    # Fallback tweet gen

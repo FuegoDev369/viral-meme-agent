@@ -1,5 +1,11 @@
+"""
+Tweet Generator — Double provider avec fallback automatique
+Primary  : Google Gemini 2.0 Flash Lite
+Fallback : Mistral Small
+"""
 from google import genai
 from google.genai import types
+from mistralai import Mistral
 import logging
 import os
 import time
@@ -14,40 +20,24 @@ RETRY_DELAY  = 25
 
 class TweetGenerator:
     def __init__(self, config):
-        self.client      = genai.Client(api_key=os.environ['GEMINI_API_KEY'])
+        # ── Gemini ────────────────────────────────────────────────────────────
+        self.gemini      = genai.Client(api_key=os.environ['GEMINI_API_KEY'])
         cfg              = config['gemini']
-        self.model       = cfg['model']
+        self.g_model     = cfg['model']
         self.temperature = cfg['temperature']
-        tw               = config['tweet_generator']
-        self.max_length      = tw['max_length']
-        self.hashtags_count  = tw['hashtags_count']
-        self.style           = tw['style']
 
-    def _call_gemini(self, prompt):
-        for attempt in range(1, MAX_RETRIES + 1):
-            try:
-                response = self.client.models.generate_content(
-                    model=self.model,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(temperature=self.temperature),
-                )
-                return response.text
-            except Exception as e:
-                err = str(e)
-                if '429' in err or 'RESOURCE_EXHAUSTED' in err:
-                    if attempt < MAX_RETRIES:
-                        logger.warning(f"[TweetGen] 429 — retry {attempt}/{MAX_RETRIES} dans {RETRY_DELAY}s...")
-                        time.sleep(RETRY_DELAY)
-                    else:
-                        raise QuotaExhaustedError(
-                            "Quota journalier Gemini épuisé. Réessaie demain après 8h UTC."
-                        )
-                else:
-                    logger.error(f"[TweetGen] Erreur Gemini: {e}")
-                    return None
+        # ── Mistral (fallback) ────────────────────────────────────────────────
+        mistral_key   = os.environ.get('MISTRAL_API_KEY', '')
+        self.mistral  = Mistral(api_key=mistral_key) if mistral_key else None
+        self.m_model  = config['mistral']['text_model']
 
-    def generate(self, analysis, original_text='', region='Global'):
-        prompt = f"""You are a viral Twitter/X growth expert. Craft a tweet that maximizes impressions and engagement.
+        tw = config['tweet_generator']
+        self.max_length     = tw['max_length']
+        self.hashtags_count = tw['hashtags_count']
+        self.style          = tw['style']
+
+    def _build_prompt(self, analysis, original_text, region):
+        return f"""You are a viral Twitter/X growth expert. Craft a tweet that maximizes impressions and engagement.
 
 CONTENT ANALYSIS:
 - Description: {analysis.get('DESCRIPTION', '')}
@@ -71,8 +61,69 @@ Respond with ONLY these two lines:
 TWEET: [tweet text without hashtags]
 HASHTAGS: [#tag1 #tag2 #tag3]
 """
-        text = self._call_gemini(prompt)  # May raise QuotaExhaustedError
-        return self._parse(text) if text else None
+
+    # ── Gemini call ───────────────────────────────────────────────────────────
+
+    def _gemini_call(self, prompt):
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                r = self.gemini.models.generate_content(
+                    model=self.g_model,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(temperature=self.temperature),
+                )
+                return r.text
+            except Exception as e:
+                if '429' in str(e) or 'RESOURCE_EXHAUSTED' in str(e):
+                    if attempt < MAX_RETRIES:
+                        logger.warning(f"[TweetGen/Gemini] 429 — retry {attempt}/{MAX_RETRIES} dans {RETRY_DELAY}s...")
+                        time.sleep(RETRY_DELAY)
+                    else:
+                        logger.warning("[TweetGen/Gemini] Quota épuisé → tentative Mistral...")
+                        raise QuotaExhaustedError("Gemini quota épuisé")
+                else:
+                    logger.error(f"[TweetGen/Gemini] Erreur: {e}")
+                    return None
+
+    # ── Mistral call ──────────────────────────────────────────────────────────
+
+    def _mistral_call(self, prompt):
+        if not self.mistral:
+            return None
+        try:
+            r = self.mistral.chat.complete(
+                model=self.m_model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=self.temperature,
+            )
+            return r.choices[0].message.content
+        except Exception as e:
+            logger.error(f"[TweetGen/Mistral] Erreur: {e}")
+            return None
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def generate(self, analysis, original_text='', region='Global'):
+        prompt = self._build_prompt(analysis, original_text, region)
+
+        # 1 — Gemini
+        try:
+            text = self._gemini_call(prompt)
+            if text:
+                logger.info("[TweetGen] ✅ Gemini OK")
+                return self._parse(text)
+        except QuotaExhaustedError:
+            pass  # → fallback Mistral
+
+        # 2 — Mistral fallback
+        text = self._mistral_call(prompt)
+        if text:
+            logger.info("[TweetGen] ✅ Mistral fallback OK")
+            return self._parse(text)
+
+        # 3 — Les deux ont échoué
+        logger.error("[TweetGen] ❌ Gemini ET Mistral ont échoué")
+        raise QuotaExhaustedError("Gemini + Mistral : quotas épuisés ou indisponibles.")
 
     def _parse(self, text):
         result = {'tweet_body': '', 'hashtags': '', 'full_tweet': ''}
@@ -88,6 +139,6 @@ HASHTAGS: [#tag1 #tag2 #tag3]
             result['tweet_body'] = result['tweet_body'][:max_body].rsplit(' ', 1)[0] + '…'
             combined = f"{result['tweet_body']} {result['hashtags']}".strip()
 
-        result['full_tweet']  = combined
-        result['char_count']  = len(combined)
+        result['full_tweet'] = combined
+        result['char_count'] = len(combined)
         return result
