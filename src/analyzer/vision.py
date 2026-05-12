@@ -1,26 +1,22 @@
 """
 Vision Analyzer — Double provider avec fallback automatique
 Primary  : Google Gemini 2.0 Flash Lite
-Fallback : Mistral Small (multimodal)
+Fallback : Mistral Small (appel HTTP direct, pas de SDK)
 """
 from google import genai
 import PIL.Image
+import requests
 import base64
 import logging
 import os
 import time
 
-try:
-    from mistralai import Mistral
-    MISTRAL_AVAILABLE = True
-except ImportError:
-    Mistral = None
-    MISTRAL_AVAILABLE = False
-
 logger = logging.getLogger(__name__)
 
-MAX_RETRIES = 3
-RETRY_DELAY = 25
+MAX_RETRIES  = 3
+RETRY_DELAY  = 25
+
+MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions"
 
 EXT_TO_MIME = {
     '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
@@ -68,19 +64,14 @@ class VisionAnalyzer:
         self.gemini  = genai.Client(api_key=os.environ['GEMINI_API_KEY'])
         self.g_model = config['gemini']['model']
 
-        # ── Mistral (fallback) ────────────────────────────────────────────────
-        self.mistral = None
-        self.m_model = config.get('mistral', {}).get('vision_model', 'mistral-small-latest')
+        # ── Mistral (fallback) — appel HTTP direct ────────────────────────────
+        self.mistral_key = os.environ.get('MISTRAL_API_KEY', '')
+        self.m_model     = config.get('mistral', {}).get('vision_model', 'mistral-small-latest')
 
-        if MISTRAL_AVAILABLE:
-            mistral_key = os.environ.get('MISTRAL_API_KEY', '')
-            if mistral_key:
-                self.mistral = Mistral(api_key=mistral_key)
-                logger.info("[Vision] Mistral fallback activé ✅")
-            else:
-                logger.warning("[Vision] MISTRAL_API_KEY absent — fallback désactivé")
+        if self.mistral_key:
+            logger.info("[Vision] Mistral fallback activé ✅")
         else:
-            logger.warning("[Vision] Package mistralai non disponible — fallback désactivé")
+            logger.warning("[Vision] MISTRAL_API_KEY absent — fallback désactivé")
 
     # ── Gemini ────────────────────────────────────────────────────────────────
 
@@ -102,38 +93,54 @@ class VisionAnalyzer:
                     logger.error(f"[Vision/Gemini] Erreur: {e}")
                     return None
 
-    # ── Mistral ───────────────────────────────────────────────────────────────
+    # ── Mistral HTTP direct ───────────────────────────────────────────────────
 
     def _mistral_vision_call(self, image_path, prompt):
-        if not self.mistral:
+        if not self.mistral_key:
             return None
         try:
             ext  = os.path.splitext(image_path)[1].lower()
             mime = EXT_TO_MIME.get(ext, 'image/jpeg')
             with open(image_path, 'rb') as f:
                 b64 = base64.b64encode(f.read()).decode('utf-8')
-            r = self.mistral.chat.complete(
-                model=self.m_model,
-                messages=[{"role": "user", "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url",
-                     "image_url": {"url": f"data:{mime};base64,{b64}"}}
-                ]}]
-            )
-            return r.choices[0].message.content
+
+            payload = {
+                "model": self.m_model,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url",
+                         "image_url": {"url": f"data:{mime};base64,{b64}"}}
+                    ]
+                }]
+            }
+            headers = {
+                "Authorization": f"Bearer {self.mistral_key}",
+                "Content-Type": "application/json"
+            }
+            r = requests.post(MISTRAL_API_URL, json=payload, headers=headers, timeout=30)
+            r.raise_for_status()
+            return r.json()['choices'][0]['message']['content']
         except Exception as e:
             logger.error(f"[Vision/Mistral] Erreur: {e}")
             return None
 
     def _mistral_text_call(self, prompt):
-        if not self.mistral:
+        if not self.mistral_key:
             return None
         try:
-            r = self.mistral.chat.complete(
-                model=self.m_model,
-                messages=[{"role": "user", "content": prompt}]
-            )
-            return r.choices[0].message.content
+            payload = {
+                "model": self.m_model,
+                "messages": [{"role": "user", "content": prompt}]
+            }
+            headers = {
+                "Authorization": f"Bearer {self.mistral_key}",
+                "Content-Type": "application/json"
+            }
+            r = requests.post(MISTRAL_API_URL, json=payload, headers=headers, timeout=30)
+            r.raise_for_status()
+            return r.json()['choices'][0]['message']['content']
         except Exception as e:
             logger.error(f"[Vision/Mistral text] Erreur: {e}")
             return None
@@ -166,7 +173,6 @@ class VisionAnalyzer:
             logger.info("[Vision] ✅ Mistral fallback OK")
             return self._parse(text)
 
-        # 3 — Les deux ont échoué
         logger.error("[Vision] ❌ Tous les providers ont échoué")
         raise QuotaExhaustedError("Gemini + Mistral : indisponibles.")
 

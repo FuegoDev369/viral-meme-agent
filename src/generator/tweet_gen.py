@@ -1,27 +1,23 @@
 """
 Tweet Generator — Double provider avec fallback automatique
 Primary  : Google Gemini 2.0 Flash Lite
-Fallback : Mistral Small
+Fallback : Mistral Small (appel HTTP direct, pas de SDK)
 """
 from google import genai
 from google.genai import types
+import requests
 import logging
 import os
 import time
-
-try:
-    from mistralai import Mistral
-    MISTRAL_AVAILABLE = True
-except ImportError:
-    Mistral = None
-    MISTRAL_AVAILABLE = False
 
 from analyzer.vision import QuotaExhaustedError
 
 logger = logging.getLogger(__name__)
 
-MAX_RETRIES = 3
-RETRY_DELAY = 25
+MAX_RETRIES  = 3
+RETRY_DELAY  = 25
+
+MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions"
 
 
 class TweetGenerator:
@@ -32,19 +28,14 @@ class TweetGenerator:
         self.g_model     = cfg['model']
         self.temperature = cfg['temperature']
 
-        # ── Mistral (fallback) ────────────────────────────────────────────────
-        self.mistral = None
-        self.m_model = config.get('mistral', {}).get('text_model', 'mistral-small-latest')
+        # ── Mistral (fallback) — appel HTTP direct ────────────────────────────
+        self.mistral_key = os.environ.get('MISTRAL_API_KEY', '')
+        self.m_model     = config.get('mistral', {}).get('text_model', 'mistral-small-latest')
 
-        if MISTRAL_AVAILABLE:
-            mistral_key = os.environ.get('MISTRAL_API_KEY', '')
-            if mistral_key:
-                self.mistral = Mistral(api_key=mistral_key)
-                logger.info("[TweetGen] Mistral fallback activé ✅")
-            else:
-                logger.warning("[TweetGen] MISTRAL_API_KEY absent — fallback désactivé")
+        if self.mistral_key:
+            logger.info("[TweetGen] Mistral fallback activé ✅")
         else:
-            logger.warning("[TweetGen] Package mistralai non disponible — fallback désactivé")
+            logger.warning("[TweetGen] MISTRAL_API_KEY absent — fallback désactivé")
 
         tw = config['tweet_generator']
         self.max_length     = tw['max_length']
@@ -100,18 +91,24 @@ HASHTAGS: [#tag1 #tag2 #tag3]
                     logger.error(f"[TweetGen/Gemini] Erreur: {e}")
                     return None
 
-    # ── Mistral ───────────────────────────────────────────────────────────────
+    # ── Mistral HTTP direct ───────────────────────────────────────────────────
 
     def _mistral_call(self, prompt):
-        if not self.mistral:
+        if not self.mistral_key:
             return None
         try:
-            r = self.mistral.chat.complete(
-                model=self.m_model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=self.temperature,
-            )
-            return r.choices[0].message.content
+            payload = {
+                "model": self.m_model,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": self.temperature,
+            }
+            headers = {
+                "Authorization": f"Bearer {self.mistral_key}",
+                "Content-Type": "application/json"
+            }
+            r = requests.post(MISTRAL_API_URL, json=payload, headers=headers, timeout=30)
+            r.raise_for_status()
+            return r.json()['choices'][0]['message']['content']
         except Exception as e:
             logger.error(f"[TweetGen/Mistral] Erreur: {e}")
             return None
@@ -136,7 +133,6 @@ HASHTAGS: [#tag1 #tag2 #tag3]
             logger.info("[TweetGen] ✅ Mistral fallback OK")
             return self._parse(text)
 
-        # 3 — Les deux ont échoué
         logger.error("[TweetGen] ❌ Tous les providers ont échoué")
         raise QuotaExhaustedError("Gemini + Mistral : indisponibles.")
 
