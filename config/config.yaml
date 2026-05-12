@@ -47,3 +47,7 @@ gemini:
 mistral:
   vision_model: mistral-small-latest  # Fallback vision (multimodal)
   text_model: mistral-small-latest    # Fallback tweet gen
+
+groq:
+  vision_model: llama-3.2-11b-vision-preview  # Fallback vision
+  text_model: llama-3.1-8b-instant            # Fallback tweet gen

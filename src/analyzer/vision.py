@@ -1,7 +1,8 @@
 """
-Vision Analyzer — Double provider avec fallback automatique
-Primary  : Google Gemini 2.0 Flash Lite
-Fallback : Mistral Small (appel HTTP direct, pas de SDK)
+Vision Analyzer — Triple provider avec fallback automatique
+1. Google Gemini 2.0 Flash Lite  (primary)
+2. Mistral Small                 (fallback, avec retry)
+3. Groq llama-3.2-11b-vision     (fallback final)
 """
 from google import genai
 import PIL.Image
@@ -13,10 +14,12 @@ import time
 
 logger = logging.getLogger(__name__)
 
-MAX_RETRIES  = 3
-RETRY_DELAY  = 25
+GEMINI_RETRIES  = 3
+MISTRAL_RETRIES = 3
+RETRY_DELAY     = 20   # secondes entre retries
 
-MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions"
+MISTRAL_URL = "https://api.mistral.ai/v1/chat/completions"
+GROQ_URL    = "https://api.groq.com/openai/v1/chat/completions"
 
 EXT_TO_MIME = {
     '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
@@ -38,7 +41,7 @@ REGION_RELEVANCE: [which regions/cultures would best relate: Global / USA / Afri
 TREND_CATEGORY: [one of: meme / reaction / wholesome / politics / sports / entertainment / news / lifestyle]
 """
 
-TEXT_PROMPT_TEMPLATE = """You are an expert in viral internet content. Based only on this text description:
+TEXT_PROMPT = """You are an expert in viral internet content. Based only on this text description:
 
 "{context}"
 
@@ -54,95 +57,146 @@ TREND_CATEGORY: [meme / reaction / wholesome / politics / sports / entertainment
 
 
 class QuotaExhaustedError(Exception):
-    """Levée quand tous les providers disponibles sont épuisés."""
+    """Levée quand tous les providers sont épuisés."""
     pass
+
+
+def _img_to_b64(image_path):
+    ext  = os.path.splitext(image_path)[1].lower()
+    mime = EXT_TO_MIME.get(ext, 'image/jpeg')
+    with open(image_path, 'rb') as f:
+        b64 = base64.b64encode(f.read()).decode('utf-8')
+    return mime, b64
 
 
 class VisionAnalyzer:
     def __init__(self, config):
-        # ── Gemini (primary) ──────────────────────────────────────────────────
+        # ── Gemini ────────────────────────────────────────────────────────────
         self.gemini  = genai.Client(api_key=os.environ['GEMINI_API_KEY'])
         self.g_model = config['gemini']['model']
 
-        # ── Mistral (fallback) — appel HTTP direct ────────────────────────────
+        # ── Mistral ───────────────────────────────────────────────────────────
         self.mistral_key = os.environ.get('MISTRAL_API_KEY', '')
         self.m_model     = config.get('mistral', {}).get('vision_model', 'mistral-small-latest')
 
-        if self.mistral_key:
-            logger.info("[Vision] Mistral fallback activé ✅")
-        else:
-            logger.warning("[Vision] MISTRAL_API_KEY absent — fallback désactivé")
+        # ── Groq ──────────────────────────────────────────────────────────────
+        self.groq_key    = os.environ.get('GROQ_API_KEY', '')
+        self.groq_v_model = config.get('groq', {}).get('vision_model', 'llama-3.2-11b-vision-preview')
+
+        providers = ['Gemini']
+        if self.mistral_key: providers.append('Mistral')
+        if self.groq_key:    providers.append('Groq')
+        logger.info(f"[Vision] Providers actifs: {' → '.join(providers)}")
 
     # ── Gemini ────────────────────────────────────────────────────────────────
 
-    def _gemini_call(self, contents):
-        for attempt in range(1, MAX_RETRIES + 1):
+    def _gemini(self, contents):
+        for attempt in range(1, GEMINI_RETRIES + 1):
             try:
-                r = self.gemini.models.generate_content(
-                    model=self.g_model, contents=contents)
+                r = self.gemini.models.generate_content(model=self.g_model, contents=contents)
                 return r.text
             except Exception as e:
                 if '429' in str(e) or 'RESOURCE_EXHAUSTED' in str(e):
-                    if attempt < MAX_RETRIES:
-                        logger.warning(f"[Vision/Gemini] 429 — retry {attempt}/{MAX_RETRIES} dans {RETRY_DELAY}s...")
+                    if attempt < GEMINI_RETRIES:
+                        logger.warning(f"[Vision/Gemini] 429 — retry {attempt}/{GEMINI_RETRIES} dans {RETRY_DELAY}s...")
                         time.sleep(RETRY_DELAY)
                     else:
-                        logger.warning("[Vision/Gemini] Quota épuisé → tentative Mistral...")
-                        raise QuotaExhaustedError("Gemini quota épuisé")
+                        logger.warning("[Vision/Gemini] Quota épuisé → Mistral...")
+                        return None  # Signale l'échec sans exception ici
                 else:
                     logger.error(f"[Vision/Gemini] Erreur: {e}")
                     return None
 
-    # ── Mistral HTTP direct ───────────────────────────────────────────────────
+    # ── Mistral ───────────────────────────────────────────────────────────────
 
-    def _mistral_vision_call(self, image_path, prompt):
+    def _mistral_vision(self, image_path, prompt):
         if not self.mistral_key:
             return None
-        try:
-            ext  = os.path.splitext(image_path)[1].lower()
-            mime = EXT_TO_MIME.get(ext, 'image/jpeg')
-            with open(image_path, 'rb') as f:
-                b64 = base64.b64encode(f.read()).decode('utf-8')
+        mime, b64 = _img_to_b64(image_path)
+        payload = {
+            "model": self.m_model,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}}
+            ]}]
+        }
+        headers = {"Authorization": f"Bearer {self.mistral_key}", "Content-Type": "application/json"}
+        for attempt in range(1, MISTRAL_RETRIES + 1):
+            try:
+                r = requests.post(MISTRAL_URL, json=payload, headers=headers, timeout=30)
+                r.raise_for_status()
+                return r.json()['choices'][0]['message']['content']
+            except Exception as e:
+                if '429' in str(e):
+                    if attempt < MISTRAL_RETRIES:
+                        logger.warning(f"[Vision/Mistral] 429 — retry {attempt}/{MISTRAL_RETRIES} dans {RETRY_DELAY}s...")
+                        time.sleep(RETRY_DELAY)
+                    else:
+                        logger.warning("[Vision/Mistral] Rate limit persistant → Groq...")
+                        return None
+                else:
+                    logger.error(f"[Vision/Mistral] Erreur: {e}")
+                    return None
 
+    def _mistral_text(self, prompt):
+        if not self.mistral_key:
+            return None
+        payload = {"model": self.m_model, "messages": [{"role": "user", "content": prompt}]}
+        headers = {"Authorization": f"Bearer {self.mistral_key}", "Content-Type": "application/json"}
+        for attempt in range(1, MISTRAL_RETRIES + 1):
+            try:
+                r = requests.post(MISTRAL_URL, json=payload, headers=headers, timeout=30)
+                r.raise_for_status()
+                return r.json()['choices'][0]['message']['content']
+            except Exception as e:
+                if '429' in str(e):
+                    if attempt < MISTRAL_RETRIES:
+                        logger.warning(f"[Vision/Mistral text] 429 — retry {attempt}/{MISTRAL_RETRIES} dans {RETRY_DELAY}s...")
+                        time.sleep(RETRY_DELAY)
+                    else:
+                        return None
+                else:
+                    logger.error(f"[Vision/Mistral text] Erreur: {e}")
+                    return None
+
+    # ── Groq ──────────────────────────────────────────────────────────────────
+
+    def _groq_vision(self, image_path, prompt):
+        if not self.groq_key:
+            return None
+        try:
+            mime, b64 = _img_to_b64(image_path)
             payload = {
-                "model": self.m_model,
-                "messages": [{
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url",
-                         "image_url": {"url": f"data:{mime};base64,{b64}"}}
-                    ]
-                }]
+                "model": self.groq_v_model,
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}}
+                ]}],
+                "max_tokens": 1024
             }
-            headers = {
-                "Authorization": f"Bearer {self.mistral_key}",
-                "Content-Type": "application/json"
-            }
-            r = requests.post(MISTRAL_API_URL, json=payload, headers=headers, timeout=30)
+            headers = {"Authorization": f"Bearer {self.groq_key}", "Content-Type": "application/json"}
+            r = requests.post(GROQ_URL, json=payload, headers=headers, timeout=30)
             r.raise_for_status()
             return r.json()['choices'][0]['message']['content']
         except Exception as e:
-            logger.error(f"[Vision/Mistral] Erreur: {e}")
+            logger.error(f"[Vision/Groq] Erreur: {e}")
             return None
 
-    def _mistral_text_call(self, prompt):
-        if not self.mistral_key:
+    def _groq_text(self, prompt):
+        if not self.groq_key:
             return None
         try:
             payload = {
-                "model": self.m_model,
-                "messages": [{"role": "user", "content": prompt}]
+                "model": "llama-3.1-8b-instant",
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 512
             }
-            headers = {
-                "Authorization": f"Bearer {self.mistral_key}",
-                "Content-Type": "application/json"
-            }
-            r = requests.post(MISTRAL_API_URL, json=payload, headers=headers, timeout=30)
+            headers = {"Authorization": f"Bearer {self.groq_key}", "Content-Type": "application/json"}
+            r = requests.post(GROQ_URL, json=payload, headers=headers, timeout=30)
             r.raise_for_status()
             return r.json()['choices'][0]['message']['content']
         except Exception as e:
-            logger.error(f"[Vision/Mistral text] Erreur: {e}")
+            logger.error(f"[Vision/Groq text] Erreur: {e}")
             return None
 
     # ── Public API ────────────────────────────────────────────────────────────
@@ -150,7 +204,6 @@ class VisionAnalyzer:
     def analyze(self, media_path, post_context=''):
         if media_path.lower().endswith('.mp4'):
             return self._analyze_text_only(post_context)
-
         try:
             img    = PIL.Image.open(media_path)
             prompt = PROMPT_TEMPLATE.format(context=post_context[:300] or 'N/A')
@@ -159,46 +212,46 @@ class VisionAnalyzer:
             return None
 
         # 1 — Gemini
-        try:
-            text = self._gemini_call([prompt, img])
-            if text:
-                logger.info("[Vision] ✅ Gemini OK")
-                return self._parse(text)
-        except QuotaExhaustedError:
-            pass
-
-        # 2 — Mistral fallback
-        text = self._mistral_vision_call(media_path, prompt)
+        text = self._gemini([prompt, img])
         if text:
-            logger.info("[Vision] ✅ Mistral fallback OK")
+            logger.info("[Vision] ✅ Gemini")
+            return self._parse(text)
+
+        # 2 — Mistral
+        text = self._mistral_vision(media_path, prompt)
+        if text:
+            logger.info("[Vision] ✅ Mistral")
+            return self._parse(text)
+
+        # 3 — Groq
+        text = self._groq_vision(media_path, prompt)
+        if text:
+            logger.info("[Vision] ✅ Groq")
             return self._parse(text)
 
         logger.error("[Vision] ❌ Tous les providers ont échoué")
-        raise QuotaExhaustedError("Gemini + Mistral : indisponibles.")
+        raise QuotaExhaustedError("Gemini + Mistral + Groq : tous indisponibles.")
 
     def _analyze_text_only(self, context):
         if not context:
             return None
-        prompt = TEXT_PROMPT_TEMPLATE.format(context=context[:400])
+        prompt = TEXT_PROMPT.format(context=context[:400])
 
-        try:
-            text = self._gemini_call(prompt)
+        for fn, label in [(self._gemini, 'Gemini'),
+                          (lambda p: self._mistral_text(p), 'Mistral'),
+                          (lambda p: self._groq_text(p), 'Groq')]:
+            try:
+                text = fn(prompt)
+            except Exception:
+                text = None
             if text:
+                logger.info(f"[Vision text] ✅ {label}")
                 result = self._parse(text)
                 if result:
                     result['IS_VIDEO'] = True
                 return result
-        except QuotaExhaustedError:
-            pass
 
-        text = self._mistral_text_call(prompt)
-        if text:
-            result = self._parse(text)
-            if result:
-                result['IS_VIDEO'] = True
-            return result
-
-        raise QuotaExhaustedError("Gemini + Mistral : indisponibles.")
+        raise QuotaExhaustedError("Tous les providers ont échoué (text-only).")
 
     def _parse(self, text):
         result = {}

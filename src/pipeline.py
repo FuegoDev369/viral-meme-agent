@@ -57,7 +57,7 @@ def post_id(post):
 
 def run():
     logger.info("=" * 60)
-    logger.info("  🚀  viral-meme-agent v4.3 starting")
+    logger.info("  🚀  viral-meme-agent v5.3 starting")
     logger.info(f"  ⏰  {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
     logger.info("=" * 60)
 
