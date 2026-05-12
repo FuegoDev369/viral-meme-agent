@@ -1,8 +1,8 @@
 """
 Tweet Generator — Triple provider avec fallback automatique
 1. Google Gemini 2.0 Flash Lite  (primary)
-2. Mistral Small                 (fallback, avec retry)
-3. Groq llama-3.1-8b-instant     (fallback final)
+2. Mistral Small                 (fallback, retry x3)
+3. Groq llama-3.1-8b-instant     (fallback final, retry x3)
 """
 from google import genai
 from google.genai import types
@@ -17,25 +17,33 @@ logger = logging.getLogger(__name__)
 
 GEMINI_RETRIES  = 3
 MISTRAL_RETRIES = 3
+GROQ_RETRIES    = 3
 RETRY_DELAY     = 20
 
 MISTRAL_URL = "https://api.mistral.ai/v1/chat/completions"
 GROQ_URL    = "https://api.groq.com/openai/v1/chat/completions"
 
 
+def _is_rate_limit(e):
+    return '429' in str(e) or 'rate' in str(e).lower()
+
+def _is_server_error(e):
+    code = None
+    if hasattr(e, 'response') and e.response is not None:
+        code = e.response.status_code
+    return code in (500, 502, 503, 504) or any(str(c) in str(e) for c in [500, 502, 503, 504])
+
+
 class TweetGenerator:
     def __init__(self, config):
-        # ── Gemini ────────────────────────────────────────────────────────────
         self.gemini      = genai.Client(api_key=os.environ['GEMINI_API_KEY'])
         cfg              = config['gemini']
         self.g_model     = cfg['model']
         self.temperature = cfg['temperature']
 
-        # ── Mistral ───────────────────────────────────────────────────────────
         self.mistral_key = os.environ.get('MISTRAL_API_KEY', '')
         self.m_model     = config.get('mistral', {}).get('text_model', 'mistral-small-latest')
 
-        # ── Groq ──────────────────────────────────────────────────────────────
         self.groq_key    = os.environ.get('GROQ_API_KEY', '')
         self.groq_model  = config.get('groq', {}).get('text_model', 'llama-3.1-8b-instant')
 
@@ -75,8 +83,6 @@ TWEET: [tweet text without hashtags]
 HASHTAGS: [#tag1 #tag2 #tag3]
 """
 
-    # ── Gemini ────────────────────────────────────────────────────────────────
-
     def _gemini(self, prompt):
         for attempt in range(1, GEMINI_RETRIES + 1):
             try:
@@ -96,8 +102,6 @@ HASHTAGS: [#tag1 #tag2 #tag3]
                     logger.error(f"[TweetGen/Gemini] Erreur: {e}")
                     return None
 
-    # ── Mistral ───────────────────────────────────────────────────────────────
-
     def _mistral(self, prompt):
         if not self.mistral_key:
             return None
@@ -113,7 +117,7 @@ HASHTAGS: [#tag1 #tag2 #tag3]
                 r.raise_for_status()
                 return r.json()['choices'][0]['message']['content']
             except Exception as e:
-                if '429' in str(e):
+                if _is_rate_limit(e):
                     if attempt < MISTRAL_RETRIES:
                         logger.warning(f"[TweetGen/Mistral] 429 — retry {attempt}/{MISTRAL_RETRIES} dans {RETRY_DELAY}s...")
                         time.sleep(RETRY_DELAY)
@@ -124,48 +128,45 @@ HASHTAGS: [#tag1 #tag2 #tag3]
                     logger.error(f"[TweetGen/Mistral] Erreur: {e}")
                     return None
 
-    # ── Groq ──────────────────────────────────────────────────────────────────
-
     def _groq(self, prompt):
         if not self.groq_key:
             return None
-        try:
-            payload = {
-                "model": self.groq_model,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": self.temperature,
-                "max_tokens": 512
-            }
-            headers = {"Authorization": f"Bearer {self.groq_key}", "Content-Type": "application/json"}
-            r = requests.post(GROQ_URL, json=payload, headers=headers, timeout=30)
-            r.raise_for_status()
-            return r.json()['choices'][0]['message']['content']
-        except Exception as e:
-            logger.error(f"[TweetGen/Groq] Erreur: {e}")
-            return None
-
-    # ── Public API ────────────────────────────────────────────────────────────
+        payload = {
+            "model": self.groq_model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": self.temperature,
+            "max_tokens": 512
+        }
+        headers = {"Authorization": f"Bearer {self.groq_key}", "Content-Type": "application/json"}
+        for attempt in range(1, GROQ_RETRIES + 1):
+            try:
+                r = requests.post(GROQ_URL, json=payload, headers=headers, timeout=30)
+                r.raise_for_status()
+                return r.json()['choices'][0]['message']['content']
+            except Exception as e:
+                if _is_server_error(e) or _is_rate_limit(e):
+                    if attempt < GROQ_RETRIES:
+                        wait = RETRY_DELAY * attempt
+                        logger.warning(f"[TweetGen/Groq] Erreur temporaire — retry {attempt}/{GROQ_RETRIES} dans {wait}s...")
+                        time.sleep(wait)
+                    else:
+                        logger.error(f"[TweetGen/Groq] Échec après {GROQ_RETRIES} tentatives: {e}")
+                        return None
+                else:
+                    logger.error(f"[TweetGen/Groq] Erreur: {e}")
+                    return None
 
     def generate(self, analysis, original_text='', region='Global'):
         prompt = self._build_prompt(analysis, original_text, region)
-
-        # 1 — Gemini
-        text = self._gemini(prompt)
-        if text:
-            logger.info("[TweetGen] ✅ Gemini")
-            return self._parse(text)
-
-        # 2 — Mistral
-        text = self._mistral(prompt)
-        if text:
-            logger.info("[TweetGen] ✅ Mistral")
-            return self._parse(text)
-
-        # 3 — Groq
-        text = self._groq(prompt)
-        if text:
-            logger.info("[TweetGen] ✅ Groq")
-            return self._parse(text)
+        for fn, label in [
+            (lambda: self._gemini(prompt),  'Gemini'),
+            (lambda: self._mistral(prompt), 'Mistral'),
+            (lambda: self._groq(prompt),    'Groq'),
+        ]:
+            text = fn()
+            if text:
+                logger.info(f"[TweetGen] ✅ {label}")
+                return self._parse(text)
 
         logger.error("[TweetGen] ❌ Tous les providers ont échoué")
         raise QuotaExhaustedError("Gemini + Mistral + Groq : tous indisponibles.")

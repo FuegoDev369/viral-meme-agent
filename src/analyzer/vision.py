@@ -1,8 +1,8 @@
 """
 Vision Analyzer — Triple provider avec fallback automatique
-1. Google Gemini 2.0 Flash Lite  (primary)
-2. Mistral Small                 (fallback, avec retry)
-3. Groq llama-3.2-11b-vision     (fallback final)
+1. Google Gemini 2.0 Flash Lite       (primary)
+2. Mistral Small                       (fallback, retry x3)
+3. Groq llama-3.2-11b-vision-preview  (fallback final, retry x3)
 """
 from google import genai
 import PIL.Image
@@ -14,9 +14,10 @@ import time
 
 logger = logging.getLogger(__name__)
 
-GEMINI_RETRIES  = 3
+GEMINI_RETRIES = 3
 MISTRAL_RETRIES = 3
-RETRY_DELAY     = 20   # secondes entre retries
+GROQ_RETRIES = 3
+RETRY_DELAY = 20  # secondes
 
 MISTRAL_URL = "https://api.mistral.ai/v1/chat/completions"
 GROQ_URL    = "https://api.groq.com/openai/v1/chat/completions"
@@ -57,7 +58,6 @@ TREND_CATEGORY: [meme / reaction / wholesome / politics / sports / entertainment
 
 
 class QuotaExhaustedError(Exception):
-    """Levée quand tous les providers sont épuisés."""
     pass
 
 
@@ -69,18 +69,25 @@ def _img_to_b64(image_path):
     return mime, b64
 
 
+def _is_rate_limit(e):
+    return '429' in str(e) or 'rate' in str(e).lower()
+
+def _is_server_error(e):
+    code = None
+    if hasattr(e, 'response') and e.response is not None:
+        code = e.response.status_code
+    return code in (500, 502, 503, 504) or any(str(c) in str(e) for c in [500, 502, 503, 504])
+
+
 class VisionAnalyzer:
     def __init__(self, config):
-        # ── Gemini ────────────────────────────────────────────────────────────
         self.gemini  = genai.Client(api_key=os.environ['GEMINI_API_KEY'])
         self.g_model = config['gemini']['model']
 
-        # ── Mistral ───────────────────────────────────────────────────────────
-        self.mistral_key = os.environ.get('MISTRAL_API_KEY', '')
-        self.m_model     = config.get('mistral', {}).get('vision_model', 'mistral-small-latest')
+        self.mistral_key  = os.environ.get('MISTRAL_API_KEY', '')
+        self.m_model      = config.get('mistral', {}).get('vision_model', 'mistral-small-latest')
 
-        # ── Groq ──────────────────────────────────────────────────────────────
-        self.groq_key    = os.environ.get('GROQ_API_KEY', '')
+        self.groq_key     = os.environ.get('GROQ_API_KEY', '')
         self.groq_v_model = config.get('groq', {}).get('vision_model', 'llama-3.2-11b-vision-preview')
 
         providers = ['Gemini']
@@ -102,7 +109,7 @@ class VisionAnalyzer:
                         time.sleep(RETRY_DELAY)
                     else:
                         logger.warning("[Vision/Gemini] Quota épuisé → Mistral...")
-                        return None  # Signale l'échec sans exception ici
+                        return None
                 else:
                     logger.error(f"[Vision/Gemini] Erreur: {e}")
                     return None
@@ -127,7 +134,7 @@ class VisionAnalyzer:
                 r.raise_for_status()
                 return r.json()['choices'][0]['message']['content']
             except Exception as e:
-                if '429' in str(e):
+                if _is_rate_limit(e):
                     if attempt < MISTRAL_RETRIES:
                         logger.warning(f"[Vision/Mistral] 429 — retry {attempt}/{MISTRAL_RETRIES} dans {RETRY_DELAY}s...")
                         time.sleep(RETRY_DELAY)
@@ -149,7 +156,7 @@ class VisionAnalyzer:
                 r.raise_for_status()
                 return r.json()['choices'][0]['message']['content']
             except Exception as e:
-                if '429' in str(e):
+                if _is_rate_limit(e):
                     if attempt < MISTRAL_RETRIES:
                         logger.warning(f"[Vision/Mistral text] 429 — retry {attempt}/{MISTRAL_RETRIES} dans {RETRY_DELAY}s...")
                         time.sleep(RETRY_DELAY)
@@ -166,38 +173,63 @@ class VisionAnalyzer:
             return None
         try:
             mime, b64 = _img_to_b64(image_path)
-            payload = {
-                "model": self.groq_v_model,
-                "messages": [{"role": "user", "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}}
-                ]}],
-                "max_tokens": 1024
-            }
-            headers = {"Authorization": f"Bearer {self.groq_key}", "Content-Type": "application/json"}
-            r = requests.post(GROQ_URL, json=payload, headers=headers, timeout=30)
-            r.raise_for_status()
-            return r.json()['choices'][0]['message']['content']
         except Exception as e:
-            logger.error(f"[Vision/Groq] Erreur: {e}")
+            logger.error(f"[Vision/Groq] Impossible de lire l'image: {e}")
             return None
+
+        payload = {
+            "model": self.groq_v_model,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}}
+            ]}],
+            "max_tokens": 1024
+        }
+        headers = {"Authorization": f"Bearer {self.groq_key}", "Content-Type": "application/json"}
+
+        for attempt in range(1, GROQ_RETRIES + 1):
+            try:
+                r = requests.post(GROQ_URL, json=payload, headers=headers, timeout=45)
+                r.raise_for_status()
+                return r.json()['choices'][0]['message']['content']
+            except Exception as e:
+                if _is_server_error(e) or _is_rate_limit(e):
+                    if attempt < GROQ_RETRIES:
+                        wait = RETRY_DELAY * attempt  # backoff progressif
+                        logger.warning(f"[Vision/Groq] Erreur temporaire — retry {attempt}/{GROQ_RETRIES} dans {wait}s...")
+                        time.sleep(wait)
+                    else:
+                        logger.error(f"[Vision/Groq] Échec après {GROQ_RETRIES} tentatives: {e}")
+                        return None
+                else:
+                    logger.error(f"[Vision/Groq] Erreur: {e}")
+                    return None
 
     def _groq_text(self, prompt):
         if not self.groq_key:
             return None
-        try:
-            payload = {
-                "model": "llama-3.1-8b-instant",
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 512
-            }
-            headers = {"Authorization": f"Bearer {self.groq_key}", "Content-Type": "application/json"}
-            r = requests.post(GROQ_URL, json=payload, headers=headers, timeout=30)
-            r.raise_for_status()
-            return r.json()['choices'][0]['message']['content']
-        except Exception as e:
-            logger.error(f"[Vision/Groq text] Erreur: {e}")
-            return None
+        payload = {
+            "model": "llama-3.1-8b-instant",
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 512
+        }
+        headers = {"Authorization": f"Bearer {self.groq_key}", "Content-Type": "application/json"}
+        for attempt in range(1, GROQ_RETRIES + 1):
+            try:
+                r = requests.post(GROQ_URL, json=payload, headers=headers, timeout=30)
+                r.raise_for_status()
+                return r.json()['choices'][0]['message']['content']
+            except Exception as e:
+                if _is_server_error(e) or _is_rate_limit(e):
+                    if attempt < GROQ_RETRIES:
+                        wait = RETRY_DELAY * attempt
+                        logger.warning(f"[Vision/Groq text] retry {attempt}/{GROQ_RETRIES} dans {wait}s...")
+                        time.sleep(wait)
+                    else:
+                        return None
+                else:
+                    logger.error(f"[Vision/Groq text] Erreur: {e}")
+                    return None
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -211,23 +243,15 @@ class VisionAnalyzer:
             logger.warning(f"Impossible d'ouvrir: {media_path}")
             return None
 
-        # 1 — Gemini
-        text = self._gemini([prompt, img])
-        if text:
-            logger.info("[Vision] ✅ Gemini")
-            return self._parse(text)
-
-        # 2 — Mistral
-        text = self._mistral_vision(media_path, prompt)
-        if text:
-            logger.info("[Vision] ✅ Mistral")
-            return self._parse(text)
-
-        # 3 — Groq
-        text = self._groq_vision(media_path, prompt)
-        if text:
-            logger.info("[Vision] ✅ Groq")
-            return self._parse(text)
+        for fn, label in [
+            (lambda: self._gemini([prompt, img]),           'Gemini'),
+            (lambda: self._mistral_vision(media_path, prompt), 'Mistral'),
+            (lambda: self._groq_vision(media_path, prompt),    'Groq'),
+        ]:
+            text = fn()
+            if text:
+                logger.info(f"[Vision] ✅ {label}")
+                return self._parse(text)
 
         logger.error("[Vision] ❌ Tous les providers ont échoué")
         raise QuotaExhaustedError("Gemini + Mistral + Groq : tous indisponibles.")
@@ -236,21 +260,18 @@ class VisionAnalyzer:
         if not context:
             return None
         prompt = TEXT_PROMPT.format(context=context[:400])
-
-        for fn, label in [(self._gemini, 'Gemini'),
-                          (lambda p: self._mistral_text(p), 'Mistral'),
-                          (lambda p: self._groq_text(p), 'Groq')]:
-            try:
-                text = fn(prompt)
-            except Exception:
-                text = None
+        for fn, label in [
+            (lambda: self._gemini(prompt),      'Gemini'),
+            (lambda: self._mistral_text(prompt), 'Mistral'),
+            (lambda: self._groq_text(prompt),    'Groq'),
+        ]:
+            text = fn()
             if text:
                 logger.info(f"[Vision text] ✅ {label}")
                 result = self._parse(text)
                 if result:
                     result['IS_VIDEO'] = True
                 return result
-
         raise QuotaExhaustedError("Tous les providers ont échoué (text-only).")
 
     def _parse(self, text):
